@@ -11,6 +11,15 @@ use crate::wallpaper::{AnimationToken, Wallpaper};
 use keyframe::{
     functions::BezierCurve, keyframes, mint::Vector2, num_traits::Pow, AnimationSequence,
 };
+macro_rules! timeit {
+    ($name:expr, $code:expr) => {{
+        let ____start____ = Instant::now();
+        let ____output____ = $code;
+
+        println!("{} took: {:?}", $name, ____start____.elapsed());
+        ____output____
+    }};
+}
 
 macro_rules! change_cols {
     ($step:ident, $old:ident, $new:ident, $done:ident) => {
@@ -92,33 +101,38 @@ impl Transition {
 
     pub fn execute(mut self, new_img: &[u8]) {
         debug!("Starting transitions");
-        match self.transition_type {
-            ArchivedTransitionType::Simple => self.simple(new_img),
-            ArchivedTransitionType::Wipe => self.wipe(new_img),
-            ArchivedTransitionType::Grow => self.grow(new_img),
-            ArchivedTransitionType::Outer => self.outer(new_img),
-            ArchivedTransitionType::Wave => self.wave(new_img),
-            ArchivedTransitionType::Fade => self.fade(new_img),
-        };
+
+        timeit!("transition :: execute", {
+            match self.transition_type {
+                ArchivedTransitionType::Simple => self.simple(new_img),
+                ArchivedTransitionType::Wipe => self.wipe(new_img),
+                ArchivedTransitionType::Grow => self.grow(new_img),
+                ArchivedTransitionType::Outer => self.outer(new_img),
+                ArchivedTransitionType::Wave => self.wave(new_img),
+                ArchivedTransitionType::Fade => self.fade(new_img),
+            };
+        });
         debug!("Transitions finished");
     }
 
     fn send_frame(&mut self, now: &mut Instant) {
-        let fps = self.fps;
-        let mut i = 0;
-        while i < self.wallpapers.len() {
-            let token = &self.animation_tokens[i];
-            if !self.wallpapers[i].has_animation_id(token) {
-                self.wallpapers.swap_remove(i);
-                self.animation_tokens.swap_remove(i);
-                continue;
+        timeit!("transition :: send_frame", {
+            let fps = self.fps;
+            let mut i = 0;
+            while i < self.wallpapers.len() {
+                let token = &self.animation_tokens[i];
+                if !self.wallpapers[i].has_animation_id(token) {
+                    self.wallpapers.swap_remove(i);
+                    self.animation_tokens.swap_remove(i);
+                    continue;
+                }
+                i += 1;
             }
-            i += 1;
-        }
-        let timeout = fps.saturating_sub(now.elapsed());
-        std::thread::sleep(timeout.mul_f32(0.9));
-        crate::wake_poll();
-        *now = Instant::now();
+            let timeout = fps.saturating_sub(now.elapsed());
+            std::thread::sleep(timeout.mul_f32(0.9));
+            crate::wake_poll();
+            *now = Instant::now();
+        });
     }
 
     fn bezier_seq(&self, start: f32, end: f32) -> (AnimationSequence<f32>, Instant) {
@@ -129,21 +143,23 @@ impl Transition {
     }
 
     fn simple(&mut self, new_img: &[u8]) {
-        let step = self.step;
-        let mut now = Instant::now();
-        let mut done = false;
-        while !done {
-            done = true;
-            for wallpaper in self.wallpapers.iter_mut() {
-                wallpaper.canvas_change(|canvas| {
-                    for (old, new) in canvas.chunks_exact_mut(4).zip(new_img.chunks_exact(3)) {
-                        change_cols!(step, old, new, done);
-                    }
-                });
-                wallpaper.draw();
+        timeit!("transition :: simple", {
+            let step = self.step;
+            let mut now = Instant::now();
+            let mut done = false;
+            while !done {
+                done = true;
+                for wallpaper in self.wallpapers.iter_mut() {
+                    wallpaper.canvas_change(|canvas| {
+                        for (old, new) in canvas.chunks_exact_mut(4).zip(new_img.chunks_exact(3)) {
+                            change_cols!(step, old, new, done);
+                        }
+                    });
+                    wallpaper.draw();
+                }
+                self.send_frame(&mut now);
             }
-            self.send_frame(&mut now);
-        }
+        });
     }
 
     fn fade(&mut self, new_img: &[u8]) {
@@ -309,55 +325,67 @@ impl Transition {
     }
 
     fn grow(&mut self, new_img: &[u8]) {
-        let (width, height) = (self.dimensions.0 as f32, self.dimensions.1 as f32);
-        let (center_x, center_y) = self.pos.to_pixel(self.dimensions, self.invert_y);
-        let mut dist_center: f32 = 0.0;
-        let dist_end: f32 = {
-            let mut x = center_x;
-            let mut y = center_y;
-            if x < width / 2.0 {
-                x = width - 1.0 - x;
-            }
-            if y < height / 2.0 {
-                y = height - 1.0 - y;
-            }
-            f32::sqrt(x.pow(2) + y.pow(2))
-        };
-        let mut now = Instant::now();
+        timeit!("transition :: grow", {
+            let (width, height) = (self.dimensions.0 as f32, self.dimensions.1 as f32);
+            let (center_x, center_y) = self.pos.to_pixel(self.dimensions, self.invert_y);
 
-        let (mut seq, start) = self.bezier_seq(0.0, dist_end);
+            let mut dist_center: f32 = 0.0;
 
-        while start.elapsed().as_secs_f64() < seq.duration() {
-            for wallpaper in self.wallpapers.iter_mut() {
-                wallpaper.canvas_change(|canvas| {
-                    for (i, (old, new)) in canvas
-                        .chunks_exact_mut(4)
-                        .zip(new_img.chunks_exact(3))
-                        .enumerate()
-                    {
-                        let (width, height) = (width as usize, height as usize);
-                        let pix_x = i % width;
-                        let pix_y = height - i / width;
-                        let diff_x = pix_x.abs_diff(center_x as usize) as f32;
-                        let diff_y = pix_y.abs_diff(center_y as usize) as f32;
-                        let pix_center_dist = f32::sqrt(diff_x.pow(2) + diff_y.pow(2));
-                        if pix_center_dist <= dist_center {
-                            let step = self
-                                .step
-                                .saturating_add((dist_center - pix_center_dist).log2() as u8);
-                            change_cols!(step, old, new);
+            let dist_end: f32 = {
+                let mut x = center_x;
+                let mut y = center_y;
+                if x < width / 2.0 {
+                    x = width - 1.0 - x;
+                }
+                if y < height / 2.0 {
+                    y = height - 1.0 - y;
+                }
+                f32::sqrt(x.pow(2) + y.pow(2))
+            };
+
+            let mut now = Instant::now();
+
+            let (mut seq, start) = self.bezier_seq(0.0, dist_end);
+
+            while start.elapsed().as_secs_f64() < seq.duration() {
+                for wallpaper in self.wallpapers.iter_mut() {
+                    wallpaper.canvas_change(|canvas| {
+                        for (i, (old, new)) in canvas
+                            .chunks_exact_mut(4)
+                            .zip(new_img.chunks_exact(3))
+                            .enumerate()
+                        {
+                            let (width, height) = (width as usize, height as usize);
+
+                            let pix_x = i % width;
+                            let pix_y = height - i / width;
+
+                            let diff_x = pix_x.abs_diff(center_x as usize) as f32;
+                            let diff_y = pix_y.abs_diff(center_y as usize) as f32;
+
+                            let pix_center_dist = f32::sqrt(diff_x.pow(2) + diff_y.pow(2));
+
+                            if pix_center_dist <= dist_center {
+                                let step = self
+                                    .step
+                                    .saturating_add((dist_center - pix_center_dist).log2() as u8);
+                                change_cols!(step, old, new);
+                            }
                         }
-                    }
-                });
-                wallpaper.draw();
-            }
-            self.send_frame(&mut now);
+                    });
 
-            dist_center = seq.now();
-            seq.advance_to(start.elapsed().as_secs_f64());
-        }
-        self.step = 4;
-        self.simple(new_img)
+                    wallpaper.draw();
+                }
+
+                self.send_frame(&mut now);
+
+                dist_center = seq.now();
+                seq.advance_to(start.elapsed().as_secs_f64());
+            }
+
+            self.step = 4;
+            self.simple(new_img)
+        })
     }
 
     fn outer(&mut self, new_img: &[u8]) {

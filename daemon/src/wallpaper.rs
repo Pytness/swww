@@ -1,5 +1,4 @@
-use utils::ipc::BgImg;
-
+use std::time::Instant;
 use std::{
     num::NonZeroI32,
     sync::{
@@ -7,6 +6,7 @@ use std::{
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
 };
+use utils::ipc::BgImg;
 
 use smithay_client_toolkit::{
     output::OutputInfo,
@@ -18,6 +18,16 @@ use smithay_client_toolkit::{
 };
 
 use wayland_client::protocol::{wl_shm, wl_surface::WlSurface};
+
+macro_rules! timeit {
+    ($name:expr, $code:expr) => {{
+        let ____start____ = Instant::now();
+        let ____output____ = $code;
+
+        println!("{} took: {:?}", $name, ____start____.elapsed());
+        ____output____
+    }};
+}
 
 #[derive(Debug)]
 struct AnimationState {
@@ -120,7 +130,7 @@ impl Wallpaper {
                 id: AtomicUsize::new(0),
                 transition_finished: Arc::new(AtomicBool::new(false)),
             },
-            configured: AtomicBool::new(false)
+            configured: AtomicBool::new(false),
         }
     }
 
@@ -164,18 +174,22 @@ impl Wallpaper {
     where
         F: FnOnce(&mut [u8]) -> T,
     {
-        loop {
-            {
+        timeit!(
+            "canvas_change :: lock",
+            loop {
                 let (inner, mut pool) = self.lock();
+
                 if let Some(canvas) = inner.slot.canvas(&mut pool) {
                     log::debug!("got canvas! - output {}", self.output_id);
-                    return f(canvas);
+                    break f(canvas);
                 }
+
+                log::debug!("failed to get canvas - output {}", self.output_id);
+
+                // sleep to mitigate busy waiting
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            log::debug!("failed to get canvas - output {}", self.output_id);
-            // sleep to mitigate busy waiting
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        )
     }
 
     #[inline]
@@ -217,20 +231,22 @@ impl Wallpaper {
     }
 
     pub fn draw(&self) {
-        let (inner, mut pool) = self.lock();
+        timeit!("draw :: lock", {
+            let (inner, mut pool) = self.lock();
 
-        let width = inner.width.get() * inner.scale_factor.get();
-        let height = inner.height.get() * inner.scale_factor.get();
-        let stride = width * 4;
+            let width = inner.width.get() * inner.scale_factor.get();
+            let height = inner.height.get() * inner.scale_factor.get();
+            let stride = width * 4;
 
-        let buf = pool
-            .create_buffer_in(&inner.slot, width, height, stride, wl_shm::Format::Xrgb8888)
-            .unwrap();
-        drop(inner);
-        let surface = self.layer_surface.wl_surface();
-        buf.attach_to(surface).unwrap();
-        surface.damage_buffer(0, 0, width, height);
-        surface.commit();
+            let buf = pool
+                .create_buffer_in(&inner.slot, width, height, stride, wl_shm::Format::Xrgb8888)
+                .unwrap();
+            drop(inner);
+            let surface = self.layer_surface.wl_surface();
+            buf.attach_to(surface).unwrap();
+            surface.damage_buffer(0, 0, width, height);
+            surface.commit();
+        });
     }
 
     pub fn resize(
@@ -242,17 +258,24 @@ impl Wallpaper {
         if let Some(s) = scale_factor {
             self.layer_surface.set_buffer_scale(s.get() as u32).unwrap();
         }
+
         let (mut inner, mut pool) = self.lock_inner_mut();
+
         let width = width.unwrap_or(inner.width);
         let height = height.unwrap_or(inner.height);
+
         let scale_factor = scale_factor.unwrap_or(inner.scale_factor);
+
         if (width, height, scale_factor) == (inner.width, inner.height, inner.scale_factor) {
             return;
         }
+
         self.inc_animation_id();
+
         inner.width = width;
         inner.height = height;
         inner.scale_factor = scale_factor;
+
         inner.slot = pool
             .new_slot(
                 inner.width.get() as usize
@@ -262,9 +285,12 @@ impl Wallpaper {
                     * 4,
             )
             .expect("failed to create slot");
+
         self.layer_surface
             .set_size(inner.width.get() as u32, inner.height.get() as u32);
+
         inner.img = BgImg::Color([0, 0, 0]);
+
         self.layer_surface.commit();
         self.configured.store(false, Ordering::Release);
     }
